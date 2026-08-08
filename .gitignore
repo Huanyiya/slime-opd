@@ -7,3 +7,6 @@
 /checkpoints/
 /.venv/
 /.cache/
+
+/Megatron-LM/.git-inner-backup/
+/slime/.git-inner-backup/
