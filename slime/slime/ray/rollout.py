@@ -688,16 +688,20 @@ class RolloutManager:
         """All node-0 engines across all servers / models."""
         return [e for srv in self.servers.values() for e in srv.engines]
 
-    def get_updatable_engines_and_lock(self):
+    def get_updatable_engines_and_lock(self, require_student_resident: bool = True):
         """Return engines eligible for weight updates.
 
         Returns engines from the first model that has
         ``update_weights=True``.  Frozen models (reference, reward,
-        etc.) are automatically excluded.
+        etc.) are automatically excluded. Disk export only needs handles and
+        cached engine metadata, so it may explicitly query while every SGLang
+        model is offloaded. Operations that touch SGLang weights retain the
+        resident-student check by default.
         """
-        if getattr(self, "_teacher_server", None) is not None and self._sequential_residency not in (
-            "student_weights",
-            "student",
+        if (
+            require_student_resident
+            and getattr(self, "_teacher_server", None) is not None
+            and self._sequential_residency not in ("student_weights", "student")
         ):
             raise RuntimeError(
                 "Sequential OPD weight update requires student weights on GPU; "

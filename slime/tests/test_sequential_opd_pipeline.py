@@ -176,7 +176,10 @@ def test_split_disk_export_leaves_resident_actor_for_driver_offload(monkeypatch)
         ),
         rollout_manager=SimpleNamespace(
             get_updatable_engines_and_lock=_RemoteMethod(
-                lambda: ([object()], object(), 0, [1], [0], [{}])
+                lambda require_student_resident=True: events.append(
+                    f"require_student_resident:{require_student_resident}"
+                )
+                or ([object()], object(), 0, [1], [0], [{}])
             )
         ),
         weight_updater=_Updater(),
@@ -202,7 +205,7 @@ def test_split_disk_export_leaves_resident_actor_for_driver_offload(monkeypatch)
     # Bypass only the timing decorator; run the real update_weights body.
     actor_module.MegatronTrainRayActor.update_weights.__wrapped__(fake_actor)
 
-    assert events == ["write_cpu_checkpoint"]
+    assert events == ["require_student_resident:False", "write_cpu_checkpoint"]
 
 
 def test_split_disk_train_keeps_actor_resident_until_export(monkeypatch):
@@ -438,16 +441,35 @@ def test_sequential_frozen_teacher_keeps_cpu_weight_backup(monkeypatch):
 
 
 def test_sequential_rollout_rejects_partial_or_wrong_gpu_residency():
+    updatable_server = SimpleNamespace(
+        update_weights=True,
+        engines=["student-engine"],
+        engine_gpu_counts=[1],
+        engine_gpu_offsets=[0],
+        engine_parallel_configs=[{}],
+        num_new_engines=0,
+    )
     manager = SimpleNamespace(
         _teacher_server=object(),
         _sequential_residency="student_weights",
+        servers={"student": updatable_server},
+        rollout_engine_lock=object(),
     )
+    manager._get_updatable_server = lambda: _call_rollout_manager("_get_updatable_server", manager)
     with pytest.raises(RuntimeError, match="complete student weights/KV"):
         _call_rollout_manager("generate", manager, rollout_id=0)
 
     manager._sequential_residency = "teacher"
     with pytest.raises(RuntimeError, match="student weights on GPU"):
         _call_rollout_manager("get_updatable_engines_and_lock", manager)
+
+    manager._sequential_residency = None
+    engines, *_ = _call_rollout_manager(
+        "get_updatable_engines_and_lock",
+        manager,
+        require_student_resident=False,
+    )
+    assert engines == ["student-engine"]
 
 
 def test_disk_reload_checks_every_student_engine_weight_version(monkeypatch, tmp_path):

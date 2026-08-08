@@ -643,6 +643,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
+        disk_weight_update = self.args.update_weight_transport == "disk"
         (
             rollout_engines,
             rollout_engine_lock,
@@ -650,10 +651,15 @@ class MegatronTrainRayActor(TrainRayActor):
             engine_gpu_counts,
             engine_gpu_offsets,
             engine_parallel_configs,
-        ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
+        ) = ray.get(
+            self.rollout_manager.get_updatable_engines_and_lock.remote(
+                # Disk export only records engine handles/metadata. It must run
+                # while Student and Teacher are both off GPU in sequential OPD.
+                require_student_resident=not disk_weight_update
+            )
+        )
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
-        disk_weight_update = self.args.update_weight_transport == "disk"
 
         if not rollout_engines and not reconnect_rollout_engines:
             if dist.get_rank() == 0:
