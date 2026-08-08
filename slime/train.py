@@ -72,11 +72,19 @@ def train(args):
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    if args.offload_rollout and not release_train:
-        ray.get(rollout_manager.onload_weights.remote())
-
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    split_disk_sync = actor_model.uses_split_disk_weight_sync()
+    if split_disk_sync:
+        initial_export = actor_model.export_weights_to_disk()
+        if release_train:
+            actor_model.release()
+        else:
+            actor_model.offload()
+        actor_model.reload_rollout_weights_from_disk(initial_export)
+    else:
+        if args.offload_rollout and not release_train:
+            ray.get(rollout_manager.onload_weights.remote())
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -144,10 +152,18 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
             excluded_time += time.time() - save_start
 
-        offload_train(actor_trains)
-        if args.offload_rollout and not release_train:
-            ray.get(rollout_manager.onload_weights.remote())
-        update_phase_metrics = actor_model.update_weights() if actor_trains else {}
+        if actor_trains and split_disk_sync:
+            export_result = actor_model.export_weights_to_disk()
+            if release_train:
+                actor_model.release()
+            else:
+                actor_model.offload()
+            update_phase_metrics = actor_model.reload_rollout_weights_from_disk(export_result)
+        else:
+            offload_train(actor_trains)
+            if args.offload_rollout and not release_train:
+                ray.get(rollout_manager.onload_weights.remote())
+            update_phase_metrics = actor_model.update_weights() if actor_trains else {}
         _log_opd_phase_times(
             args,
             current_train_step,

@@ -60,10 +60,21 @@ class _FakeActorGroup:
         self.events = events
         self.update_count = 0
 
-    def update_weights(self):
+    def uses_split_disk_weight_sync(self):
+        return True
+
+    def export_weights_to_disk(self):
         self.update_count += 1
-        self.events.append(f"actor_disk_sync_{self.update_count}")
+        self.events.append(f"actor_disk_export_{self.update_count}")
+        return {"weight_version": str(self.update_count), "disk_weight_dir": f"weight-{self.update_count}"}
+
+    def reload_rollout_weights_from_disk(self, export_result):
+        self.events.append("student_weights_onload")
+        self.events.append(f"student_disk_reload_{export_result['weight_version']}")
         return {}
+
+    def offload(self):
+        self.events.append("actor_offload")
 
     def async_train(self, rollout_id, rollout_data_ref, external_data=None):
         self.events.append("actor_train")
@@ -118,9 +129,11 @@ def test_one_sequential_opd_iteration_has_exclusive_gpu_phase_order(monkeypatch)
     train_module.train(args)
 
     assert events == [
-        # Startup: load only student weights, sync actor checkpoint, then KV.
+        # Startup: export while Actor is resident, offload it, then load Student.
+        "actor_disk_export_1",
+        "actor_offload",
         "student_weights_onload",
-        "actor_disk_sync_1",
+        "student_disk_reload_1",
         "student_kv_onload",
         # Rollout and frozen-teacher forward never overlap residency.
         "student_rollout",
@@ -130,17 +143,19 @@ def test_one_sequential_opd_iteration_has_exclusive_gpu_phase_order(monkeypatch)
         # The outer offload is idempotent, then Megatron exclusively trains.
         "student_offload",
         "actor_train",
-        # Publish updated actor and prepare the next student rollout.
+        # Export before the single Actor offload, then prepare Student rollout.
+        "actor_disk_export_2",
+        "actor_offload",
         "student_weights_onload",
-        "actor_disk_sync_2",
+        "student_disk_reload_2",
         "student_kv_onload",
         "rollout_dispose",
         "tracking_finish",
     ]
 
 
-def test_disk_sync_uses_cached_topology_without_nccl_or_actor_weights(monkeypatch):
-    """Disk export must keep both NCCL and CUDA actor memory paused."""
+def test_split_disk_export_leaves_resident_actor_for_driver_offload(monkeypatch):
+    """The export phase must not hide an actor sleep/offload transition."""
 
     events = []
 
@@ -165,6 +180,8 @@ def test_disk_sync_uses_cached_topology_without_nccl_or_actor_weights(monkeypatc
             )
         ),
         weight_updater=_Updater(),
+        _train_residency="gpu",
+        _defer_offload_until_disk_export=lambda: True,
     )
 
     monkeypatch.setattr(actor_module.ray, "get", lambda value: value)
@@ -185,7 +202,50 @@ def test_disk_sync_uses_cached_topology_without_nccl_or_actor_weights(monkeypatc
     # Bypass only the timing decorator; run the real update_weights body.
     actor_module.MegatronTrainRayActor.update_weights.__wrapped__(fake_actor)
 
-    assert events == ["write_cpu_checkpoint", "destroy_topology"]
+    assert events == ["write_cpu_checkpoint"]
+
+
+def test_split_disk_train_keeps_actor_resident_until_export(monkeypatch):
+    events = []
+    fake_actor = SimpleNamespace(
+        args=SimpleNamespace(debug_rollout_only=False, offload_train=True),
+        wake_up=lambda: events.append("actor_wake"),
+        _get_rollout_data=lambda _ref: {"batch": "data"},
+        role="actor",
+        train_actor=lambda *_args, **_kwargs: events.append("actor_train"),
+        _defer_offload_until_disk_export=lambda: True,
+        sleep=lambda: events.append("actor_sleep"),
+    )
+    monkeypatch.setattr(actor_module.torch.cuda, "synchronize", lambda: None)
+
+    actor_module.MegatronTrainRayActor.train(fake_actor, 0, object())
+
+    assert events == ["actor_wake", "actor_train"]
+
+
+def test_periodic_save_does_not_offload_resident_split_disk_actor(monkeypatch):
+    events = []
+    fake_actor = SimpleNamespace(
+        args=SimpleNamespace(
+            debug_rollout_only=False,
+            offload_train=True,
+            async_save=False,
+            save_hf=None,
+        ),
+        role="actor",
+        _train_residency="gpu",
+        model=object(),
+        optimizer=object(),
+        opt_param_scheduler=object(),
+        wake_up=lambda: events.append("actor_wake"),
+        sleep=lambda: events.append("actor_sleep"),
+        _defer_offload_until_disk_export=lambda: True,
+    )
+    monkeypatch.setattr(actor_module, "save", lambda *_args, **_kwargs: events.append("save"))
+
+    actor_module.MegatronTrainRayActor.save_model.__wrapped__(fake_actor, 0)
+
+    assert events == ["save"]
 
 
 def test_actor_wake_waits_for_h2d_before_reloading_nccl(monkeypatch):

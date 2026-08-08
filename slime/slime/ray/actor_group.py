@@ -161,21 +161,74 @@ class RayTrainGroup:
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
         start_time = time.time()
-        if not self._full_disk_weight_update_enabled():
-            result = ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        if self.uses_split_disk_weight_sync():
+            raise RuntimeError(
+                "Full disk weight synchronization has two explicit phases. "
+                "Call export_weights_to_disk(), offload/release the actor, then "
+                "reload_rollout_weights_from_disk()."
+            )
+
+        if self._full_disk_weight_update_enabled():
+            # Non-colocated disk users do not share an offload boundary and
+            # retain the original single-call behavior.
+            weight_version = self._disk_weight_version + 1
+            disk_weight_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{weight_version:06d}"
+            ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+            self._disk_weight_version = weight_version
+            if self._release_train_enabled():
+                self.release()
+            self._reload_rollout_weights_from_disk(disk_weight_dir, str(weight_version))
             if getattr(self.args, "log_opd_phase_times_only", False):
                 return {"weight_sync_time": time.time() - start_time}
-            return result
+            return {}
 
+        result = ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        if getattr(self.args, "log_opd_phase_times_only", False):
+            return {"weight_sync_time": time.time() - start_time}
+        return result
+
+    def export_weights_to_disk(self):
+        """Export the resident Megatron actor without touching rollout GPUs.
+
+        The returned descriptor is deliberately passed to the reload phase by
+        the driver.  This keeps the actor offload boundary visible: every TP
+        rank must finish exporting before SGLang is allowed to onload.
+        """
+        if not self._full_disk_weight_update_enabled():
+            raise RuntimeError("export_weights_to_disk() requires full disk weight synchronization.")
+
+        start_time = time.time()
         weight_version = self._disk_weight_version + 1
         disk_weight_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{weight_version:06d}"
         ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
         self._disk_weight_version = weight_version
-        if self._release_train_enabled():
-            self.release()
-        self._reload_rollout_weights_from_disk(disk_weight_dir, str(weight_version))
+        return {
+            "disk_weight_dir": disk_weight_dir,
+            "weight_version": str(weight_version),
+            # Keep the common phase start so the final metric also includes
+            # the explicit actor offload between export and rollout reload.
+            "sync_started_at": start_time,
+        }
+
+    def reload_rollout_weights_from_disk(self, export_result):
+        """Load a completed disk export into SGLang after actor offload."""
+        if not self._full_disk_weight_update_enabled():
+            raise RuntimeError("reload_rollout_weights_from_disk() requires full disk weight synchronization.")
+
+        disk_weight_dir = Path(export_result["disk_weight_dir"])
+        weight_version = str(export_result["weight_version"])
+        if weight_version != str(self._disk_weight_version):
+            raise RuntimeError(
+                "Refusing to reload a stale disk export: "
+                f"export version={weight_version}, current version={self._disk_weight_version}."
+            )
+
+        reload_start = time.time()
+        self._reload_rollout_weights_from_disk(disk_weight_dir, weight_version)
         if getattr(self.args, "log_opd_phase_times_only", False):
-            return {"weight_sync_time": time.time() - start_time}
+            sync_started_at = float(export_result.get("sync_started_at", reload_start))
+            return {"weight_sync_time": time.time() - sync_started_at}
+        return {}
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
@@ -227,6 +280,14 @@ class RayTrainGroup:
             self.role == "actor"
             and self.args.update_weight_mode == "full"
             and self.args.update_weight_transport == "disk"
+        )
+
+    def uses_split_disk_weight_sync(self):
+        """Whether export and rollout reload require an explicit offload boundary."""
+        return (
+            self._full_disk_weight_update_enabled()
+            and self.args.offload_train
+            and self.args.offload_rollout
         )
 
     def _reload_rollout_weights_from_disk(self, disk_weight_dir, weight_version):

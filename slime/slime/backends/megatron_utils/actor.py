@@ -50,6 +50,16 @@ logger = logging.getLogger(__name__)
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def _defer_offload_until_disk_export(self) -> bool:
+        """Whether the driver owns the train -> export -> offload boundary."""
+        return (
+            self.role == "actor"
+            and self.args.offload_train
+            and self.args.offload_rollout
+            and self.args.update_weight_mode == "full"
+            and self.args.update_weight_transport == "disk"
+        )
+
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
         self,
@@ -419,7 +429,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             del rollout_data
-            self.sleep()
+            if not self._defer_offload_until_disk_export():
+                self.sleep()
 
         return result
 
@@ -601,8 +612,10 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         # torch dist may trigger nccl communication during saving.
-        if self.args.offload_train:
+        woke_for_save = False
+        if self.args.offload_train and self._train_residency == "cpu":
             self.wake_up()
+            woke_for_save = True
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
@@ -617,7 +630,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.save_hf is not None and self.role == "actor":
             save_hf_model_to_path(self.args, Path(self.args.save_hf.format(rollout_id=rollout_id)), self.model)
 
-        if self.args.offload_train:
+        if woke_for_save and not self._defer_offload_until_disk_export():
             self.sleep()
 
     @timer
@@ -647,7 +660,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info("No updatable SGLang engines are running; skip weight update.")
             return
 
-        if reconnect_rollout_engines:
+        if reconnect_rollout_engines and self._train_residency == "cpu":
             self.wake_up()
         elif self.args.offload_train and not disk_weight_update:
             reload_process_groups()
@@ -665,10 +678,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         # A disk exporter for TP/PP/EP > 1 needs live CUDA parameter shards
-        # for its collective.  Do not stage TensorBackuper's paused CPU
-        # snapshot back to CUDA: that copy can return hggcErrorInvalidValue on
-        # PPU.  Instead resume the actor only for the bucketed export, then
-        # offload it again before SGLang reloads the newly written checkpoint.
+        # for its collective. If this is the initial synchronization the actor
+        # is still offloaded, so resume it here. During normal training it is
+        # already resident and is intentionally kept resident through export.
         onloaded_for_parallel_disk_export = False
         if (
             disk_weight_update
@@ -703,12 +715,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     self.weights_backuper.backup("old_actor")
 
-        if onloaded_for_parallel_disk_export:
+        defer_offload = self._defer_offload_until_disk_export()
+        if onloaded_for_parallel_disk_export and not defer_offload:
             self.sleep()
 
-        if reconnect_rollout_engines:
+        if reconnect_rollout_engines and not defer_offload:
             self.sleep()
-        elif self.args.offload_train and not onloaded_for_parallel_disk_export:
+        elif self.args.offload_train and not onloaded_for_parallel_disk_export and not defer_offload:
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
