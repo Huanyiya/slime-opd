@@ -1,0 +1,9 @@
+
+# OPD generated files
+/slime/eval/
+/slime/run_logs/
+/eval/
+/checkpoints_hf/
+/checkpoints/
+/.venv/
+/.cache/
