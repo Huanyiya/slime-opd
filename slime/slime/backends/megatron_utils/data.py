@@ -78,6 +78,11 @@ def get_batch(
             to_device_blocking(value, device=device, dtype=torch.long)
             for value in batch["opd_topk_token_ids"]
         ]
+    if batch.get("opd_topk_rollout_log_probs") is not None:
+        batch["opd_topk_rollout_log_probs"] = [
+            to_device_blocking(value, device=device, dtype=torch.float32)
+            for value in batch["opd_topk_rollout_log_probs"]
+        ]
     if batch.get("opd_topk_teacher_log_probs") is not None:
         batch["opd_topk_teacher_log_probs"] = [
             to_device_blocking(value, device=device, dtype=torch.float32)
@@ -317,6 +322,7 @@ def log_rollout_data(
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "opd_topk_token_ids",
+                "opd_topk_rollout_log_probs",
                 "opd_topk_teacher_log_probs",
                 "global_batch_sizes",
                 "num_microbatches",

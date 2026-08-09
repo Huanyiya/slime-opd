@@ -594,6 +594,7 @@ def train_one_step(
                     "teacher_log_probs",
                     "opd_reverse_kl",
                     "opd_topk_token_ids",
+                    "opd_topk_rollout_log_probs",
                     "opd_topk_teacher_log_probs",
                     "rollout_mask_sums",
                 ],

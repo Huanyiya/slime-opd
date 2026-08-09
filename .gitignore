@@ -3,6 +3,7 @@
 /slime/eval/
 /slime/run_logs/
 /eval/
+/sft/
 /checkpoints_hf/
 /checkpoints/
 /.venv/

@@ -271,7 +271,9 @@ def _write_eval_rollouts(data, output_path: Path, *, group_size: int) -> None:
 
 
 def _use_topk_opd(args) -> bool:
-    return bool(getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") == "topk")
+    return bool(
+        getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") in {"topk", "topk_detatch"}
+    )
 
 
 def _decode_base64_array(meta_info: dict, field_name: str, dtype, expected_size: int) -> np.ndarray:

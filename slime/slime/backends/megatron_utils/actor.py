@@ -467,7 +467,7 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
-        pure_topk_opd = self.args.use_opd and self.args.opd_loss_type == "topk"
+        pure_topk_opd = self.args.use_opd and self.args.opd_loss_type in {"topk", "topk_detatch"}
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)

@@ -75,7 +75,7 @@ def _extract_opd_topk_data(
     *,
     expected_num_tokens: int,
     top_k: int,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     output_top_logprobs = meta_info.get("output_top_logprobs")
     if output_top_logprobs is None:
         raise ValueError("SGLang response is missing output_top_logprobs for Top-K OPD.")
@@ -100,16 +100,17 @@ def _extract_opd_topk_data(
                 f"Malformed SGLang output_top_logprobs entries at response position {position}."
             ) from exc
     topk_ids = torch.tensor(id_rows, dtype=torch.int32).reshape(expected_num_tokens, top_k)
+    topk_log_probs = torch.tensor(logprob_rows, dtype=torch.float32).reshape(expected_num_tokens, top_k)
     # SGLang top logprobs are normalized over the complete vocabulary. Convert
     # them directly to probabilities; do not renormalize within the selected K.
-    topk_probs = torch.exp(torch.tensor(logprob_rows, dtype=torch.float64)).reshape(expected_num_tokens, top_k)
+    topk_probs = torch.exp(topk_log_probs.to(torch.float64))
     probability_sums = {
         "student_topk_prob_sum": float(topk_probs.sum(dim=-1).sum().item()),
         "student_top1_prob": float(topk_probs[:, 0].sum().item()),
     }
     if top_k >= 4:
         probability_sums["student_top4_prob_sum"] = float(topk_probs[:, :4].sum(dim=-1).sum().item())
-    return topk_ids, probability_sums
+    return topk_ids, topk_log_probs, probability_sums
 
 
 def _to_int_list(tokens) -> list[int]:
@@ -169,6 +170,7 @@ class Sample:
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
     opd_topk_token_ids: list[list[int]] | torch.Tensor | None = None
+    opd_topk_rollout_log_probs: list[list[float]] | torch.Tensor | None = None
     opd_topk_teacher_log_probs: list[list[float]] | torch.Tensor | None = None
 
     class Status(Enum):
@@ -398,14 +400,15 @@ class Sample:
         use_opd_topk = bool(
             args is not None
             and getattr(args, "use_opd", False)
-            and getattr(args, "opd_loss_type", "sampled") == "topk"
+            and getattr(args, "opd_loss_type", "sampled") in {"topk", "topk_detatch"}
         )
         if use_opd_topk and new_token_count:
             top_k = int(args.opd_top_k)
             if pad_missing_opd_topk:
                 new_topk_ids = torch.zeros((new_token_count, top_k), dtype=torch.int32)
+                new_topk_log_probs = torch.zeros((new_token_count, top_k), dtype=torch.float32)
             else:
-                new_topk_ids, student_probability_sums = _extract_opd_topk_data(
+                new_topk_ids, new_topk_log_probs, student_probability_sums = _extract_opd_topk_data(
                     meta_info,
                     expected_num_tokens=new_token_count,
                     top_k=top_k,
@@ -425,6 +428,18 @@ class Sample:
                         f"got={tuple(existing_topk_ids.shape)}, expected=(*, {top_k})."
                     )
                 self.opd_topk_token_ids = torch.cat([existing_topk_ids, new_topk_ids], dim=0)
+            if self.opd_topk_rollout_log_probs is None:
+                self.opd_topk_rollout_log_probs = new_topk_log_probs
+            else:
+                existing_topk_log_probs = torch.as_tensor(self.opd_topk_rollout_log_probs, dtype=torch.float32)
+                if existing_topk_log_probs.ndim != 2 or existing_topk_log_probs.shape[1] != top_k:
+                    raise ValueError(
+                        "Existing opd_topk_rollout_log_probs has incompatible shape: "
+                        f"got={tuple(existing_topk_log_probs.shape)}, expected=(*, {top_k})."
+                    )
+                self.opd_topk_rollout_log_probs = torch.cat(
+                    [existing_topk_log_probs, new_topk_log_probs], dim=0
+                )
 
         routed_experts = decode_int32_meta_array(meta_info, "routed_experts")
         if routed_experts is not None:
@@ -525,6 +540,13 @@ class Sample:
                     "opd_topk_token_ids must have shape [response_length, K]: "
                     f"got={tuple(topk_ids.shape)}, response_length={self.response_length}."
                 )
+            if self.opd_topk_rollout_log_probs is not None:
+                rollout_topk_log_probs = torch.as_tensor(self.opd_topk_rollout_log_probs)
+                if tuple(rollout_topk_log_probs.shape) != tuple(topk_ids.shape):
+                    raise ValueError(
+                        "opd_topk_rollout_log_probs must match opd_topk_token_ids shape: "
+                        f"got={tuple(rollout_topk_log_probs.shape)}, expected={tuple(topk_ids.shape)}."
+                    )
 
 
 @dataclass(frozen=True)

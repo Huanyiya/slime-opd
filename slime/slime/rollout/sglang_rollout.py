@@ -183,7 +183,7 @@ async def generate(
         "return_logprob": True,
     }
 
-    use_opd_topk = getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") == "topk"
+    use_opd_topk = getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") in {"topk", "topk_detatch"}
     collect_opd_topk = use_opd_topk and not evaluation
     if collect_opd_topk:
         payload["top_logprobs_num"] = args.opd_top_k

@@ -251,7 +251,6 @@ GRPO_ARGS=(
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --opd-k1-diff-clip 10.0
 )
 
 OPTIMIZER_ARGS=(
@@ -278,7 +277,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-opd
-   --wandb-group qwen3.5-4B-opd-qwen3.5-9B-topk-bsz64-clip10
+   --wandb-group qwen3.5-4B-opd-qwen3.5-9B-topk-bsz64-clip10-renormalization
 )
 
 SGLANG_ARGS=(

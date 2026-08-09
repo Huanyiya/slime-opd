@@ -1157,23 +1157,20 @@ def opd_topk_loss_function(
 
     student_topk_log_probs = torch.cat(student_topk_log_probs, dim=0)
     teacher_topk_log_probs = torch.cat(local_teacher_topk_log_probs, dim=0)
-    weights = torch.softmax(student_topk_log_probs, dim=-1)
-    raw_per_candidate_kl = compute_approx_kl(
-        student_topk_log_probs,
-        teacher_topk_log_probs,
-        kl_loss_type=getattr(args, "opd_kl_loss_type", "k1"),
-    )
-    # Diagnostic metrics use the same student Top-K probability weighting as
-    # the loss, but intentionally use the raw (pre-clip) KL values.
-    raw_opd_topk_per_token = (weights * raw_per_candidate_kl).sum(dim=-1)
+    # The distribution is restricted to the same student-selected Top-K IDs
+    # for both models.  Re-normalize over K before computing the exact reverse
+    # KL, rather than treating the full-vocabulary log-probs as a distribution
+    # over only these entries.
+    student_logq = F.log_softmax(student_topk_log_probs, dim=-1)
+    teacher_logq = F.log_softmax(teacher_topk_log_probs, dim=-1)
+    student_q = student_logq.exp()
+    opd_topk_per_token = (student_q * (student_logq - teacher_logq)).sum(dim=-1)
     token_kl_variances = _compute_per_sequence_token_kl_variances(
-        raw_opd_topk_per_token,
+        opd_topk_per_token,
         total_lengths,
         response_lengths,
         batch["loss_masks"],
     )
-    per_candidate_kl = _clip_k1_opd_delta(raw_per_candidate_kl, args)
-    opd_topk_per_token = (weights * per_candidate_kl).sum(dim=-1)
 
     # sum_of_sample_mean applies the (CP-sliced) loss mask and denominator.
     # Do not multiply by loss_mask before calling it.
@@ -1188,27 +1185,112 @@ def opd_topk_loss_function(
         "opd_topk_loss": opd_topk_loss.detach(),
         "student_entropy": student_entropy.detach(),
     }
-    _append_k1_opd_clip_metrics(
-        reported_loss,
-        raw_per_candidate_kl,
-        torch.cat(
-            [
-                torch.as_tensor(
-                    slice_log_prob_with_cp(mask, total_length, response_length),
-                    device=raw_per_candidate_kl.device,
-                )
-                for mask, total_length, response_length in zip(
-                    batch["loss_masks"], total_lengths, response_lengths, strict=True
-                )
-            ],
-            dim=0,
-        ),
-        args,
-    )
     # This hidden variable-length vector bypasses the scalar metric reducer;
     # reduce_train_step_metrics gathers all sequences before taking quantiles.
     reported_loss[OPD_TOKEN_KL_VARIANCES_KEY] = token_kl_variances
     return loss, reported_loss
+
+
+def opd_topk_detatch_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute Top-K OPD with rollout-derived detached PPO advantages."""
+    topk_ids = batch.get("opd_topk_token_ids")
+    rollout_topk_log_probs = batch.get("opd_topk_rollout_log_probs")
+    teacher_topk_log_probs = batch.get("opd_topk_teacher_log_probs")
+    if topk_ids is None or rollout_topk_log_probs is None or teacher_topk_log_probs is None:
+        raise ValueError(
+            "Top-K detached OPD requires token IDs plus rollout-student and teacher Top-K logprobs."
+        )
+    if logits.dtype != torch.float32 or logits.ndim != 3 or logits.size(0) != 1:
+        raise ValueError(f"Top-K OPD expected float32 logits [1,T,V_local], got {logits.dtype} {logits.shape}.")
+
+    total_lengths = batch["total_lengths"]
+    response_lengths = batch["response_lengths"]
+    logits_2d = logits.squeeze(0)
+    rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+    if rollout_temperature != 1.0:
+        logits_2d = logits_2d / rollout_temperature
+    aligned_topk_ids = _build_response_aligned_topk_ids(
+        logits_2d.size(0), logits_2d.device, topk_ids, total_lengths, response_lengths, args.allgather_cp
+    )
+    selected_log_probs, entropy_full = calculate_selected_log_probs_and_entropy(
+        logits_2d.contiguous(),
+        aligned_topk_ids,
+        mpu.get_tensor_model_parallel_group(),
+        chunk_size=args.log_probs_chunk_size,
+    )
+    current_topk_log_probs, student_entropy = _extract_per_sample(
+        selected_log_probs, entropy_full, total_lengths, response_lengths, args.allgather_cp
+    )
+    if args.allgather_cp:
+        response_data = {
+            "current_topk_log_probs": current_topk_log_probs,
+            "student_entropy": student_entropy,
+        }
+        _allgather_cp_redistribute(
+            response_data,
+            logits_local_len=logits_2d.size(0),
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+        )
+        current_topk_log_probs = response_data["current_topk_log_probs"]
+        student_entropy = response_data["student_entropy"]
+
+    local_rollout_topk_log_probs = [
+        slice_log_prob_with_cp(old_log_probs, total_length, response_length)
+        for old_log_probs, total_length, response_length in zip(
+            rollout_topk_log_probs, total_lengths, response_lengths, strict=True
+        )
+    ]
+    local_teacher_topk_log_probs = [
+        slice_log_prob_with_cp(teacher_log_probs, total_length, response_length)
+        for teacher_log_probs, total_length, response_length in zip(
+            teacher_topk_log_probs, total_lengths, response_lengths, strict=True
+        )
+    ]
+    for position, (current_log_probs, old_log_probs, teacher_log_probs) in enumerate(
+        zip(current_topk_log_probs, local_rollout_topk_log_probs, local_teacher_topk_log_probs, strict=True)
+    ):
+        expected_shape = current_log_probs.shape
+        if old_log_probs.shape != expected_shape or teacher_log_probs.shape != expected_shape:
+            raise ValueError(
+                f"Current/rollout/teacher Top-K logprob shape mismatch for sample {position}: "
+                f"{tuple(expected_shape)}, {tuple(old_log_probs.shape)}, {tuple(teacher_log_probs.shape)}."
+            )
+        if current_log_probs.ndim != 2 or current_log_probs.shape[1] != args.opd_top_k:
+            raise ValueError(
+                f"Top-K OPD expected local [R,{args.opd_top_k}] logprobs, got {tuple(current_log_probs.shape)}."
+            )
+
+    current_log_probs = torch.cat(current_topk_log_probs, dim=0)
+    old_log_probs = torch.cat(local_rollout_topk_log_probs, dim=0)
+    teacher_log_probs = torch.cat(local_teacher_topk_log_probs, dim=0)
+    # Old rollout values, teacher values, Top-K weights, and advantages must
+    # remain constants. Only current actor logprobs participate in autograd.
+    with torch.no_grad():
+        old_log_probs = old_log_probs.detach()
+        teacher_log_probs = teacher_log_probs.detach()
+        weights = torch.softmax(old_log_probs, dim=-1)
+        advantage = -weights * (old_log_probs - teacher_log_probs)
+    ratio = torch.exp(current_log_probs - old_log_probs)
+    pg1 = -advantage * ratio
+    pg2 = -advantage * ratio.clamp(1 - args.eps_clip, 1 + args.eps_clip)
+    loss_per_token = torch.maximum(pg1, pg2).sum(dim=-1)
+
+    opd_topk_detatch_loss = sum_of_sample_mean(loss_per_token)
+    student_entropy = sum_of_sample_mean(torch.cat(student_entropy, dim=0))
+    loss = args.opd_kl_coef * opd_topk_detatch_loss
+    if loss_per_token.numel() == 0:
+        loss = loss + 0 * logits.sum()
+    return loss, {
+        "loss": loss.detach(),
+        "opd_topk_detatch_loss": opd_topk_detatch_loss.detach(),
+        "student_entropy": student_entropy.detach(),
+    }
 
 
 def policy_loss_function(
@@ -1603,6 +1685,8 @@ def loss_function(
 
     if args.use_opd and args.opd_loss_type == "topk":
         func = opd_topk_loss_function
+    elif args.use_opd and args.opd_loss_type == "topk_detatch":
+        func = opd_topk_detatch_loss_function
     else:
         match args.loss_type:
             case "policy_loss":

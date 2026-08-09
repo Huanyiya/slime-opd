@@ -55,6 +55,7 @@ _ROLLOUT_DATA_TENSOR_DTYPES = {
     "rollout_top_p_token_offsets": torch.int32,
     "teacher_log_probs": torch.float32,
     "opd_topk_token_ids": torch.int32,
+    "opd_topk_rollout_log_probs": torch.float32,
     "opd_topk_teacher_log_probs": torch.float32,
     "rollout_routed_experts": None,
 }
@@ -1063,10 +1064,11 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
-        if self.args.use_opd and self.args.opd_loss_type == "topk":
+        if self.args.use_opd and self.args.opd_loss_type in {"topk", "topk_detatch"}:
             expected_k = self.args.opd_top_k
             for sample in samples:
                 topk_ids = torch.as_tensor(sample.opd_topk_token_ids)
+                rollout_topk_log_probs = torch.as_tensor(sample.opd_topk_rollout_log_probs)
                 teacher_topk_log_probs = torch.as_tensor(sample.opd_topk_teacher_log_probs)
                 expected_shape = (sample.response_length, expected_k)
                 if tuple(topk_ids.shape) != expected_shape:
@@ -1078,7 +1080,13 @@ class RolloutManager:
                         "opd_topk_teacher_log_probs shape "
                         f"{tuple(teacher_topk_log_probs.shape)} does not match {expected_shape}."
                     )
+                if tuple(rollout_topk_log_probs.shape) != expected_shape:
+                    raise ValueError(
+                        "opd_topk_rollout_log_probs shape "
+                        f"{tuple(rollout_topk_log_probs.shape)} does not match {expected_shape}."
+                    )
             train_data["opd_topk_token_ids"] = [sample.opd_topk_token_ids for sample in samples]
+            train_data["opd_topk_rollout_log_probs"] = [sample.opd_topk_rollout_log_probs for sample in samples]
             train_data["opd_topk_teacher_log_probs"] = [
                 sample.opd_topk_teacher_log_probs for sample in samples
             ]
@@ -1139,6 +1147,7 @@ class RolloutManager:
                 "prompt",
                 "teacher_log_probs",
                 "opd_topk_token_ids",
+                "opd_topk_rollout_log_probs",
                 "opd_topk_teacher_log_probs",
             ]:
                 if key not in data:
@@ -1638,7 +1647,9 @@ def compute_metrics_from_samples(args, samples):
 
 
 def _compute_topk_overlap_metrics(args, samples):
-    if not (getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") == "topk"):
+    if not (
+        getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") in {"topk", "topk_detatch"}
+    ):
         return {}
 
     metrics = {}
@@ -1685,7 +1696,9 @@ def _compute_topk_overlap_metrics(args, samples):
 
 
 def _compute_student_topk_probability_metrics(args, samples):
-    if not (getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") == "topk"):
+    if not (
+        getattr(args, "use_opd", False) and getattr(args, "opd_loss_type", "sampled") in {"topk", "topk_detatch"}
+    ):
         return {}
 
     metric_names = ["student_topk_prob_sum", "student_top1_prob"]

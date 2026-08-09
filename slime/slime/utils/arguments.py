@@ -1170,9 +1170,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-loss-type",
                 type=str,
-                choices=["sampled", "topk"],
+                choices=["sampled", "topk", "topk_detatch"],
                 default="sampled",
-                help="OPD loss path. 'sampled' keeps the sampled-token objective; 'topk' uses student Top-K tokens.",
+                help=(
+                    "OPD loss path. 'sampled' keeps the sampled-token objective; 'topk' uses exact "
+                    "student-Top-K reverse KL; 'topk_detatch' uses rollout Top-K logprobs for detached PPO advantages."
+                ),
             )
             parser.add_argument(
                 "--opd-top-k",
@@ -1804,9 +1807,9 @@ def slime_validate_args(args):
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
-        if args.opd_loss_type == "topk":
+        if args.opd_loss_type in {"topk", "topk_detatch"}:
             if args.opd_type != "sglang":
-                raise ValueError("--opd-loss-type=topk currently requires --opd-type=sglang.")
+                raise ValueError("Top-K OPD loss types currently require --opd-type=sglang.")
             if args.opd_top_k <= 0:
                 raise ValueError(f"--opd-top-k must be positive, got {args.opd_top_k}.")
 
